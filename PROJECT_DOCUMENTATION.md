@@ -1,6 +1,7 @@
 # Project Documentation — AI Resume-Grounded Interview Preparation Platform
 
 > **Note for readers of the public repository:** this is the project's detailed engineering log. It occasionally refers to internal working notes, backups (`archive/`), comparison scripts (`integration_checks/`), legacy code and private data (lecture slides, test resumes, model weights) that are not part of this repository.
+
 > Scope: this document describes the whole repository end to end, as the code actually behaves today, including where older documents (`README.md`, `docs/architecture/*`) have drifted from it. Superseded documents (the old version of this file, `WORKFLOW_INTEGRATION_GUIDE.md`, `WEBCAM_AND_GAZE_MONITORING.md`) were moved to `archive/` (not in the repository).
 > Convention: paths are relative to the repository root. Unless noted otherwise, Python module names refer to files in `main_cap/cap/`.
 
@@ -38,6 +39,7 @@
    - 4.23 [App shell & the full interview flow (frontend)](#423-app-shell--the-full-interview-flow)
    - 4.24 [Slide RAG pipeline (`rag_system/rag_tester/slide_rag/`)](#424-slide-rag-pipeline)
    - 4.25 [Question bank and session types](#425-question-bank-and-session-types)
+   - 4.26 [Live interview state and production mode (`live_store.py`, `serve.py`)](#426-live-interview-state-and-production-mode-live_storepy-servepy)
 5. [Entry Points & Execution Flow](#5-entry-points--execution-flow)
 6. [Error Handling & Edge Cases](#6-error-handling--edge-cases)
 7. [Known Limitations / Tech Debt / TODOs](#7-known-limitations--tech-debt--todos)
@@ -175,12 +177,14 @@ Packages the code imports that are **missing from `Requirements_Global.txt`**: `
 **SQLite**, one file at `main_cap/cap/instance/app.db`, accessed through Flask-SQLAlchemy. Its schema is versioned with Alembic migrations in `main_cap/cap/migrations/`, which are applied automatically when the app starts.
 - **Tables:** `users`, `student_profiles`, `resumes`, `interview_sessions`, `session_turns` (see §4.21).
 - **Resume files:** stored on the server's disk under `instance/uploads/resumes/<user_id>/`; the database keeps their paths.
-- **Moving to PostgreSQL:** set `CAP_DATABASE_URL`. No code changes are needed.
+- **PostgreSQL (production mode, verified 2026-10-15):** set `CAP_DATABASE_URL=postgresql+psycopg://user:password@host:5432/dbname` (driver `psycopg` 3). The migrations, all app tests and a live end-to-end run pass unchanged on PostgreSQL 16. Two PostgreSQL-specific safeguards: connections are pinned to UTC (`database.configure_database`), and interview text taken from parsed resumes is trimmed to its column length before saving (`models._fit_strings_to_columns`; SQLite ignores `VARCHAR` lengths, PostgreSQL rejects longer values). SQLite stays the default.
 
-**Still in memory:** the live state of an interview in progress:
-- `conversation_engine._conversations` (planner, evaluator, memory);
-- `session_history._live`;
-- `app._candidate_profiles` / `_profile_owners`.
+**Live interview state** (an interview in progress) is kept in the **live store** (`live_store.py`), not in the database:
+- profile sessions (`app._put_profile_session`): the parsed profile loaded for one interview;
+- Round 1 conversations (`conversation_engine`): profile, pinned evaluator, answers and their evaluations;
+- links from a conversation to its database row, and the live technical interview (`session_history`).
+
+Two backends: **memory** (default; this process only) and **Redis** (`CAP_LIVE_STORE=redis`; shared by every worker and kept across restarts). Details in §4.26.
 
 Every answered turn is written to the database immediately, so a restart loses nothing already answered. Unfinished sessions are marked `abandoned`.
 
@@ -205,14 +209,14 @@ Every answered turn is written to the database immediately, so a restart loses n
        │ /api/sessions, /api/insights                       │                         │  <id>/end}
 ┌──────▼──────────────────▼───────────────────────────────▼────────────────────────▼──────────────┐
 │  Flask app (app.py)  ·  before_request login guard  ·  account_routes / session_routes blueprints │
-│  in-memory live state: _candidate_profiles(+owners) · conversation_engine._conversations ·       │
-│                        session_history._live                                                      │
+│  live interview state → live_store.py: memory (default) or Redis (shared by all workers)         │
+│                         profile sessions · Round 1 conversations · technical interviews           │
 └──────┬──────────────────┬───────────────────────────────┬────────────────────────┬──────────────┘
        │                  │                               │                        │
 ┌──────▼───────────┐ ┌────▼─────────────────────┐ ┌───────▼───────────────────┐ ┌──▼──────────────┐
 │ SQLite (instance/│ │ Resume Intelligence      │ │ Conversation Engine (v2)  │ │ Quiz helpers    │
 │ app.db) via      │ │ Engine: 8 deterministic  │ │ Planner → Realizer →      │ │ tech_interview/ │
-│ SQLAlchemy:      │ │ stages → CandidateProfile│ │ Evaluator (Hybrid /       │ │ bank · selector │
+│ SQLAlchemy:      │ │ stages → CandidateProfile│ │ Evaluator (Averaged /     │ │ bank · selector │
 │ users, profiles, │ │ (parsed once at upload,  │ │ Heuristic) → Ledger       │ │ NLI grader      │
 │ resumes, sessions│ │ stored on the Resume row)│ └──────────┬────────────────┘ └──┬──────────────┘
 │ turns            │◄┴──────────────────────────┘            │ each turn           │ each turn
@@ -242,7 +246,7 @@ Every answered turn is written to the database immediately, so a restart loses n
 | **Planner** | `planner.py`, `topic_pool.py`, `question_specification.py`, `traceability.py`, `coverage_tracker.py` | Deterministic *what to ask* | Conversation engine |
 | **Realizer** | `question_realizer.py`, `question_families.py`, `discussion_policy.py`, `interview_question.py`, `conversation_memory.py` | *How to phrase it* (families, transitions, anti-repetition) | Conversation engine |
 | **Conversation Engine** | `conversation_engine.py` | Session lifecycle; the only module importing both planning and evaluation types | Planner, realizer, evaluation engine |
-| **Evaluation** | `evaluator.py`, `evaluator_registry.py`, `evaluation_request.py`, `evaluation_result.py`, `evaluation_engine.py`, `heuristic_evaluator.py`, `hybrid_evaluator.py`, `reasoning_dimension_relevance.py`, `expected_concepts_registry.py` | Stable evaluator interface and implementations | Conversation engine |
+| **Evaluation** | `averaged_evaluator.py`, `overall_single_evaluator.py`, `answer_gate.py`, `evaluator.py`, `evaluator_registry.py`, `evaluation_request.py`, `evaluation_result.py`, `evaluation_engine.py`, `heuristic_evaluator.py`, `hybrid_evaluator.py`, `reasoning_dimension_relevance.py`, `expected_concepts_registry.py` | Stable evaluator interface and implementations | Conversation engine |
 | **Trained model layer** | `model_backbone.py`, `model_heads.py`, `model_dataset.py`, `model_checkpoint_io.py`, `model_evaluator.py`, `deployment_evaluator.py` | DeBERTa-v3 multi-task evaluator: training, inference, startup wiring | Evaluator registry |
 | **Coaching** | `strong_answer.py`, `concept_analysis.py` | Deterministic coaching note and concept-coverage % | Conversation engine |
 | **ML research track** | `training_example*.py`, `generation_*.py`, `prompt_*.py`, `coverage_strategy.py`, `dataset_*.py`, `labeling_operations.py`, `training_experimentation.py`, `rewrite_*.py`, `deterministic_rewrite*.py`, `run_*.py` | Produce and benchmark training data and checkpoints | Model layer (offline) |
@@ -261,7 +265,7 @@ sequenceDiagram
     participant CE as conversation_engine
     participant P as Planner/TopicPool
     participant QR as question_realizer
-    participant EV as Evaluator (Hybrid/Heuristic)
+    participant EV as Evaluator (Averaged/Heuristic, answer gate)
 
     participant DB as SQLite (session_history)
 
@@ -308,7 +312,22 @@ Flow invariants:
 | **Two traceability gates** | The *shape* gate (exactly one origin) runs at profile generation; the *substance* gate (the origin actually exists on this profile) runs in `TopicPool._build`, where the full profile is available. Rejected topics go to `TopicPool.rejected`. |
 | **The evaluator interface is the architecture** | `Evaluator` Protocol + registry + frozen `EvaluationResult`, so heuristic → pretrained → fine-tuned models can be swapped without touching routes, session code or the UI. The evaluator is pinned per session so a session is never scored by two model versions. |
 | **Hybrid Round 3: DeBERTa authoritative** (superseded 2026-09-30 by `AveragedEvaluator`, §4.6; kept as the fallback tier) | On the 362-example held-out test set, raw DeBERTa scored QWK 0.3976, the heuristic 0.1341, and the Round 2 blended hybrid 0.1814. Blending let the weaker model override the stronger one, so DeBERTa now scores and the heuristic supplies feedback text, confidence, a downgrade-only guardrail, and fallback. |
-| **NLI used only as a contradiction flag** | Entailment rewarded lexical echoing, so NLI never contributes to a score. |
+| **Round 1: NLI used only as a contradiction flag** | On open-ended resume answers, entailment against the grounding text rewarded lexical echoing, so in Round 1 NLI never contributes to a score. (Round 2 is different: there each answer is checked against short, specific key points, where entailment is the right test; see below.) |
+| **Round 1: blend 0.8 × trained model + 0.2 × heuristic** (`AveragedEvaluator`) | The trained model is far better at ranking answers (QWK 0.86 vs 0.10), but on the 58-answer stress set the pure model occasionally crushed a strong answer; a small heuristic share removed those cases without lowering QWK. The heuristic also supplies the per-dimension scores and feedback text the model doesn't produce. |
+| **Round 1: a non-answer gate after every evaluator** | Both models can be fooled by a keyword dump (one scored 0.79 "good"). A cheap rule layer that caps "idk", one-word, keyword-list, gibberish and pasted-code replies at 0.1 works whichever evaluator is active, and was checked to flag 0 of 628 genuine answers. |
+| **Local models only at interview time** (no LLM API anywhere on the request path) | No per-interview cost or quota failures (Gemini's free tier ran out during development), resumes and answers never leave the machine, latency is predictable (~0.3 s per technical answer on CPU), and the same answer always gets the same score. The cost is smaller models, so the graders are weaker than a large LLM on informal answers. |
+| **Technical questions generated offline, selected at runtime** | A question generated live can't be checked before the candidate sees it. Offline, every key point is verified against a slide quote, judged by a second LLM pass and hand-reviewed; at runtime selection is a lookup that needs no GPU. The cost is a fixed bank whose gaps must be filled by another offline run. |
+| **Slides grouped into sections; hybrid FAISS + BM25 retrieval with a cross-encoder reranker** | Faculty slides spread one idea over several "(contd.)" and build-up slides, so page-per-chunk retrieval missed them (hit@5 68–82%); sections lifted it to 96–100%. Dense embeddings catch paraphrases, BM25 catches exact terms ("BCNF", "TCP"), and the reranker reads query and section together to order the top 20 precisely (without it DBMS hit@5 drops 1.00 → 0.95). |
+| **Every key point must quote the slides** (fuzzy match ≥ 88, checked in code) | The cheapest reliable guard against a hallucinated "fact" becoming something candidates are graded on. The LLM judge and hand review catch what quote-checking can't (a true quote attached to a false claim). |
+| **Round 2: grade by key points with NLI, not by similarity to a model answer** | Similarity rewards sharing words: "context switching is when the context switches" outscored a correct answer. Checking whether the answer *states* each expected point (entailment) is explainable — the report shows ✓/~/✗ per point — and tells the interviewer exactly which follow-up to ask. Score = 0.85 × key points + 0.15 × similarity to the reference, so the points dominate and the similarity term gives a little credit for overall correct framing. |
+| **Round 2: a follow-up for a missing point instead of an immediate low score** | Real interviewers probe what you left out. Asking the prepared follow-up for a specific missing point (≤ 2 per question) lets a candidate who knew it recover partial credit (0.75 of the point) and keeps the interview conversational. |
+| **Round 2: short, single-claim key points** | Measured, not assumed: making points longer and "more complete" made grading worse (a correct handshake answer fell 0.96 → 0), because NLI only credits a point the answer supports in full. Detail belongs in the reference answer. |
+| **Round 2 safeguards: contradiction cap, abbreviation expansion, similarity floor** | Each fixes a measured failure: fluent wrong answers scored full marks (the reference contradicting the whole answer now caps it at 0.2; checks per point or per sentence also fired on correct answers, so they were rejected); "DFS" wasn't recognised as "depth-first search"; NLI hallucinated 0.99 entailment between unrelated texts (no credit below 0.25 similarity). |
+| **Serve a hand-curated tier, weighted toward the most-asked topics** | Automated ranking can't tell a correct-but-odd question from a good interview question. Serving only questions a human scored 8+/10, with ×6 weight on topics interviewers ask most, makes 87% of asked questions come from those topics while still never repeating a topic within a session. |
+| **A fresh labelled set that is never tuned on** | The grader looked like 89–92% agreement on LLM-written answers and was 64% on human-style ones; tuning on a set flatters it. Changes are judged on the fresh set, and the benchmark fails on any regression against `baseline.json`. |
+| **Gaze: iris position weighted above head pose, calibrated per user** | People glance away with their eyes without turning the head, so gaze carries 0.55 of the signal and head pose 0.35. A per-session baseline absorbs camera angle and face shape; hysteresis, 5-frame confirmation and staged timers (caution 3.5 s, warning 8.5 s) stop normal glances from triggering warnings, and looking down right after typing is tolerated. |
+| **Liveness by head turn, not blink** | Blink detection was unreliable on ordinary webcams (blinks missed at low resolution or frame rate); a random left/right head turn is a clear, reliable challenge that a photo can't pass. |
+| **Camera alerts visual only; quality issues warn, never block** | Spoken warnings could be transcribed into the answer by the microphone. Blocking on lighting would lock out candidates in ordinary rooms, so only "no camera / no face / more than one face" block the start. |
 | **Reject, never repair (data pipeline)** | Any failed validation discards the whole generation attempt, so no partially-fixed example enters the dataset. |
 | **Specification-level (group) splits** | Examples from the same `QuestionSpecification` at different quality tiers had leaked across train and test in the first experiment. |
 | **API-free Track B augmentation** | Gemini's free tier (20 requests/model/day) blocked data collection, so deterministic rewrites plus an SBERT drift check replaced it. |
@@ -324,21 +343,35 @@ Flow invariants:
 - **Gemini** (`google-genai` client, lazy singleton, `gemini-2.5-flash`): dev tooling only (see §2).
 - **Hugging Face Hub**: model downloads at first use.
 - **MediaPipe via jsDelivr**: browser-side face landmarking.
-- **SQLite** (local file). There is no external DB, queue or cache service.
+- **SQLite** (local file) by default; in production mode **PostgreSQL** and **Redis** (§4.26). There is no queue service.
 
 ### 3.6 Deployment / runtime architecture
-- There are **no Dockerfile, CI, WSGI or cloud config files**. The app runs with `python app.py` from `main_cap/cap/`, which uses Flask's development server: `app.run(debug=False, port=5000, threaded=True, use_reloader=False)`.
+- **Two ways to run:** `python app.py` from `main_cap/cap/` (Flask's development server: `app.run(debug=False, port=5000, threaded=True, use_reloader=False)`), or `docker compose up` from the repository root (production mode, below). There is no CI or cloud config.
 - **Startup sequence:**
   1. load `.env`;
   2. `bootstrap_production_evaluator()`;
   3. `init_accounts(app)`, which configures SQLite, applies pending migrations, loads or creates the secret key, and sets up Flask-Login and the 10 MB upload limit;
   4. register `sessions_bp`;
-  5. mark every still-`in_progress` session `abandoned`.
+  5. with the memory live store, mark every still-`in_progress` session `abandoned` (with Redis they survive and are kept).
 - **Runtime data** lives in `main_cap/cap/instance/` (git-ignored):
   - `app.db`: the database;
   - `uploads/`: resume files;
   - `secret_key`: the Flask secret, generated once so logins survive restarts.
-- It is a **single process**. Account and history data are durable (SQLite), but *live* interview state is in memory, so the app can't be scaled across workers as-is.
+- **Simple mode** (`python app.py`): one process, SQLite, live state in memory; a restart ends interviews in progress (their answered turns are kept).
+- **Production mode** (`python serve.py`, waitress): PostgreSQL + Redis live state + a shared `CAP_SECRET_KEY` and upload folder, so **several processes or servers can serve the same users** and an interview survives a restart. Verified 2026-10-15 with two servers sharing one PostgreSQL and one Redis, every request alternating between them and one server restarted mid-interview (§4.26).
+- **Docker** (`Dockerfile`, `docker-compose.yml`, `.dockerignore`, `docker/`): `docker compose up` runs production mode as three containers: `app` (`serve.py`), `postgres:16` and `redis:7` (append-only file on, so live interviews also survive a Redis restart). Why each choice:
+  - **CPU-only PyTorch** (2.13.0+cpu): nothing at interview time needs a GPU, and the CUDA build is about 2 GB larger.
+  - **Models downloaded at build time** (`docker/download_models.py`, into `HF_HOME=/opt/hf`): the container starts with no internet and loads every model in about 3 s.
+  - **Layers ordered by how often they change** (torch → packages → models → code): a code change rebuilds only the last layer, in seconds. First build about 13 min (downloads about 3 GB); image about 6 GB.
+  - **Exact package versions** (`docker/constraints.txt`): the image installs the tested versions; `Requirements_Global.txt` keeps lower bounds. Only the app's part of the requirements is installed (the slide pipeline, developer tools and tests are left out).
+  - **An allow-list `.dockerignore`**: only `main_cap/cap/` (without tests and `instance/`), `resume_classifier/`, the question bank and the requirements go into the image.
+  - **The trained evaluator weights are mounted, not copied** (read-only, from `deployed_model_overall_single_v5_1088/`): they aren't part of the image, rebuilds don't copy 735 MB, and a missing file (as in the public repository) falls back to the heuristic evaluator as usual.
+  - **Volumes**: `pgdata` (database), `redisdata` (live interviews), `app-data` on `instance/` (uploads and the generated secret key, so logins survive the container being replaced).
+  - **PostgreSQL and Redis publish no ports**: only the app can reach them. The app runs as a non-root user, has a health check on `/health`, and every container restarts automatically (`restart: unless-stopped`).
+  - **Settings** come from an optional `.env` (`.env.example`): port, `POSTGRES_PASSWORD`, `CAP_SECRET_KEY`, `CAP_THREADS`.
+  - **Starting and stopping** (from the repository root): `docker compose up -d` starts the stack in the background; `docker compose down` stops it safely. Each container gets up to 10 s to shut down (PostgreSQL writes everything to disk), then the containers are removed, but the volumes are kept, so accounts, resumes, history and interviews in progress are all there after the next `up` (an interview carries on from Redis; only an answer being sent at that exact moment is lost). `docker compose stop` / `start` does the same without removing the containers. **`docker compose down -v` deletes the volumes and with them every account and upload.** Closing the Docker Desktop window leaves the stack running; quitting Docker Desktop stops it (data kept), and `docker compose up -d` brings it back.
+  - **Moving data between databases** (`copy_database.py`, e.g. the SQLite file into Docker's PostgreSQL; commands in the README): copies every table in foreign-key order with the same ids, trims text to the column lengths PostgreSQL enforces, moves the id sequences past the copied rows, and copies the resume files. It refuses a non-empty target unless `--replace`. Resume paths are stored with `/` (`resume_store.py`) because rows written on Windows used `\`, which Linux can't open; old rows are still read and are converted when copied. Verified 2026-10-15: the local SQLite data (2 accounts, 13 sessions, 45 turns, 2 resume files) copied into Docker with every value and file identical.
+  - **Verified 2026-10-15:** full journey (sign-up, Round 1, both technical interviews, history) inside Docker; the app container restarted in the middle of Round 1 and of a technical interview, and both carried on; after `docker compose down` / `up` the account, uploaded resume and history were all there. On Linux in the container: 1,252 app tests passed (24 skipped) and 511 resume-engine tests passed.
 - **Model deployment** is file-based: copy `best_checkpoint_weights.pt`, `best_checkpoint.json` and `final_promotion_decision.json` into `main_cap/cap/deployed_model/`. `deployment_evaluator.bootstrap_production_evaluator()` checks that all three exist and that the promotion is approved *before* loading anything. Otherwise it skips the ~700 MB backbone download entirely and activates the heuristic evaluator.
 - **Training** ran on Google Colab (the `artifact_uri` in `best_checkpoint.json` is `/content/e4/artifacts/experiment_4_train/best_checkpoint_weights.pt`).
 
@@ -352,12 +385,10 @@ Flow invariants:
 capstone_latest/
 ├── README.md                         Project readme (partly outdated — see §7)
 ├── PROJECT_DOCUMENTATION.md          This document
-├── mcq_tobedone.md                   Plan for the MCQ / question-bank generation (not built yet)
 ├── grader_eval/                      Grader test sets: questions.json, output_questions.json (400 LLM-written
 │                                     answers), my_answers.json (40 real answers), tuning_set/, run_*.py,
 │                                     real_set/ (team answers + ANSWER_PROMPT.md), benchmark.py + baseline.json,
 │                                     sanity_check.py
-├── technical_interview_problems_and_improvements.md   Technical-interview problems, plan and progress log
 ├── CONTRIBUTING.md                   Branch workflow (main / adaptive-engine / resume_classifier)
 ├── Requirements_Global.txt           The only requirements file (sectioned per subsystem)
 ├── .gitignore                        Ignores venvs, caches, *.pt/*.safetensors, artifacts/, .env, diagnostics
@@ -877,14 +908,14 @@ Planner over 36 profiles → CoverageUnit pool
 4. `init_accounts(app)` (database, migrations, secret key, Flask-Login, accounts routes, 413 handler), `register_blueprint(sessions_bp)`, `abandon_all_open_sessions()`.
 5. `_require_login_for_api` (`before_request`): every `/api/*` path answers **401** without a session, except `/api/auth/login` and `/api/auth/signup`. `/` and `/health` stay public.
 6. `sys.path` gets `resume_classifier/`, then `from rag_integration import rag_generator` is attempted (`_rag_available` evaluates to False; see §4.15), then `resume_classifier` is re-prioritised.
-7. Module-level stores: `_candidate_profiles`, `_profile_owners` (profile session id → `(user_id, resume_id)`), the RAG question pool, and `SAMPLE_QUESTIONS` (5 computer-networks questions with fill-mask).
+7. Profile sessions in the live store (`_put_profile_session` / `_profile_session` / `_get_profile`: profile session id → `{profile, user_id, resume_id}`, §4.26); module-level: the RAG question pool and `SAMPLE_QUESTIONS` (5 computer-networks questions with fill-mask).
 
 **Routes** (the accounts and history routes are in §4.20–4.21):
 | Route | Method | Used by the UI | Summary |
 |---|---|---|---|
 | `/` | GET | ✅ | Serves `index.html` |
 | `/health` | GET | — | `{"status":"ok"}` |
-| `/api/resumes/<id>/use` | POST | ✅ | Loads a **saved** resume's parsed profile into `_candidate_profiles` (no upload, no re-parse) and returns `profile_to_frontend_format` + `session_id` + `resume`. Other users' ids → 404 |
+| `/api/resumes/<id>/use` | POST | ✅ | Loads a **saved** resume's parsed profile into a profile session (live store; no upload, no re-parse) and returns `profile_to_frontend_format` + `session_id` + `resume`. Other users' ids → 404 |
 | `/api/classify-resume` | POST (multipart `file`) | ✅ | Main-page upload: `account_routes.add_resume_for_user` stores, parses and saves it as the **current** resume, then the same response as `/use`. Unreadable/unsupported → 400 (the saved resume is kept) |
 | `/api/resume-discussion-v2/start` | POST `{session_id}` | ✅ | Checks the profile session belongs to `current_user`; `conversation_engine.start_conversation`; then `session_history.begin_resume_discussion` |
 | `/api/resume-discussion-v2/reply` | POST `{session_id, answer}` | ✅ | Ownership check (`owns_conversation`), `advance_conversation`, then `record_resume_discussion_turn` |
@@ -918,7 +949,15 @@ A single page with inline CSS and JS, and no framework. Screens are top-level co
 **Other mechanisms:**
 - **Answer boxes:** both (`#user-input`, `#rd-user-input`) are multi-line `<textarea class="answer-box">`: Enter sends, Shift+Enter adds a line.
 - **Profile photo:** `fillAvatar(el, url, fallback)` puts the photo (or initials) in the top-right circle, on the Profile page and next to the candidate's technical-chat messages; picker on signup step 1 (`setSignupPhoto`) and on the Profile page (`renderProfilePhoto`, `removeProfilePhoto`).
-- **Voice input:** two Web Speech API recognizers, `rdRecognition` (Round 1) and `recognition` (technical). Both suspend the blur check while a mic permission prompt may be open (`proctorSuspendBlur` / `rdMicSettled`).
+- **Voice input** (`createVoiceInput`, one controller per answer box: `rdVoice` for Round 1, `techVoice` for technical). Click once to start recording and again to stop; the recording is turned into text **on our server** (`POST /api/transcribe`, `speech_to_text.py`) and added to the box after any typed text. Why it works this way:
+  - **Server-side Whisper, not the browser's speech recognition.** The Web Speech API only works in Google Chrome and Microsoft Edge, which send the audio to Google or Microsoft; in Brave it always fails with a "network" error, and Firefox doesn't have it. Recording (`MediaRecorder`, webm/opus, ogg or mp4) works in every current browser, and Whisper is free, runs on the CPU and keeps the audio on our server.
+  - **Model `base.en`** (faster-whisper, int8, about 145 MB; `CAP_WHISPER_MODEL`). Measured on this machine: an 11 s technical answer transcribed word-perfect ("Redis", "Docker", "800 milliseconds") in 0.6 s. `small.en` was about 3× slower and misheard "Redis". Silence is cut first (VAD), so a silent recording gives no text instead of invented words. Loaded in the background at startup (`model_warmup`) and baked into the Docker image.
+  - **Audio decoded by our own code** (`decode_audio`, PyAV → 16 kHz mono) instead of faster-whisper's decoder, which passes an option current PyAV no longer accepts. Nothing is stored; recordings over 5 minutes are refused (the page stops at 5).
+  - **The trade-off:** text appears about a second after you click stop, not live while you speak.
+  - **Sending while recording or transcribing** finishes the text first, then sends (`whenIdle`); a second press doesn't send twice. Sending or disabling the box discards anything still in flight (`stop({discard: true})`), so late text never lands in the next answer.
+  - **Errors are shown:** microphone blocked, no microphone, a recording that can't be read, a server failure, or no speech heard.
+  - **Permissions up front:** `requestMediaPermissions()` asks for the camera and microphone together when the app opens (`enterApp`) and again in the camera check (before full screen) if either is still undecided. A mic prompt in the middle of an interview used to drop full screen. Nothing is recorded then; the tracks stop at once. If the mic is refused, a message says voice answers are off and how to allow them. The blur check is still suspended while the microphone starts, in case a prompt appears anyway.
+  - Tested by `test_voice_input.js` (fake microphone, recorder and server) and `test_speech_to_text.py` (the route, decoding, and the real model on `test_data/voice_answer.webm`, an 11 s spoken answer).
 - **Typewriter:** `typeLine(el, text)` uses a per-element cancellation token, so a superseded call stops and its promise never resolves (the fix for a race condition).
 - **System log:** `setSystemLog` plus an idle cycle.
 - **Escaping:** `esc()` HTML-escapes user and server text everywhere, including the technical chat (`addMessage` escapes plain-text messages; questions, topics and feedback are escaped).
@@ -1112,7 +1151,7 @@ Resume engine internals: TextSpan → DocumentModel → Section → ParserResult
 
 | Interface | Producer → Consumer | Contract |
 |---|---|---|
-| `CandidateProfile` dict | engine mapper → `Resume.parsed_profile` (DB) → `app._candidate_profiles` → `Planner`, `profile_to_frontend_format` | Pydantic schema §4.3; no `None`s |
+| `CandidateProfile` dict | engine mapper → `Resume.parsed_profile` (DB) → profile session (live store) → `Planner`, `profile_to_frontend_format` | Pydantic schema §4.3; no `None`s |
 | `session_history.*` | `app.py` interview routes, `session_routes` → SQLite | `begin_resume_discussion` / `record_resume_discussion_turn` / `finish_resume_discussion`; `begin_technical_session` / `record_technical_turn` / `finish_technical_session`; abandonment helpers |
 | `interview*` hooks | INTERVIEW FLOW → SESSION INTEGRITY (JS) | `interviewSessionActive`, `interviewCurrentTurn`, `interviewRoundLabel`, `interviewDisableInput`, `interviewResumeInput`, `interviewStopMic`, `interviewTerminate`, `startInterviewMode` |
 | `Planner.plan_next(ConversationState)` / `advance(spec_id, UnitStatus)` | planner → conversation engine | Returns a `QuestionSpecification` or `None` |
@@ -1139,6 +1178,7 @@ Resume engine internals: TextSpan → DocumentModel → Section → ParserResult
 | `DEPLOYED_MODEL_DIR`, `_DEPLOYED_MAX_LENGTH` | `deployed_model/`, 128 | `deployment_evaluator.py` |
 | `PROCTOR_BLUR_GRACE_MS` | 1500 | Session-integrity blur grace (JS) |
 | `CAP_DATABASE_URL` | `sqlite:///main_cap/cap/instance/app.db` | Database URL (any SQLAlchemy URL, e.g. PostgreSQL) |
+| `CAP_TEST_DATABASE_URL` | unset (in-memory SQLite) | Run the test suite on PostgreSQL instead, e.g. `postgresql+psycopg://cap:cap@localhost:5432/cap_test`; uses databases `cap_test` and `cap_test_unit`, created if missing and emptied at the start of each run (`_test_db.py`) |
 | `CAP_UPLOAD_DIR` | `main_cap/cap/instance/uploads` | Where resume files are stored |
 | `CAP_SECRET_KEY` | generated once into `instance/secret_key` | Flask session secret; set explicitly in production |
 | `MAX_UPLOAD_BYTES` / `MAX_CONTENT_LENGTH` | 10 MB | Upload limit; larger requests get a JSON 413 |
@@ -1160,6 +1200,10 @@ Resume engine internals: TextSpan → DocumentModel → Section → ParserResult
 | `CAP_QUESTION_BANK_DIR` | `rag_system/rag_tester/question_bank` | Where the app reads the question bank |
 | `CAP_TRAINED_EVALUATOR` | on | Round 1 uses the averaged evaluator when the v5_1088 model file is installed; `0` forces the heuristic evaluator |
 | `CAP_MODEL_WARMUP` | on | `python app.py` loads every model in a background thread at startup; `0` disables |
+| `CAP_LIVE_STORE` | `memory` | Where live interviews are kept: `memory` (one process) or `redis` (shared by workers, survives restarts) (§4.26) |
+| `CAP_REDIS_URL` | `redis://localhost:6379/0` | Redis for `CAP_LIVE_STORE=redis` |
+| `CAP_TEST_REDIS_URL` | unset | Run the Redis backend's own tests (`test_live_store.py`; that Redis database is flushed) |
+| `CAP_HOST` / `CAP_PORT` / `CAP_THREADS` | `127.0.0.1` / `5000` / `8` | `serve.py` (production server, waitress) |
 | `HF_HUB_OFFLINE` | set to `1` automatically when all models are cached | Loads models without checking huggingface.co (`model_warmup.use_local_models_only`); an explicit value is respected |
 | `tech_interview.grader` constants | `NLI_MODEL=cross-encoder/nli-deberta-v3-base`, covered entail ≥ 0.60 (or ≥ 0.20 with sim ≥ 0.80), `KEYPOINT_WEIGHT=0.85`, follow-ups: `FU_COVERED_ENTAIL=0.50`, `FU_PARTIAL_SIM=0.60`, `FU_REPLY_MATCH_SIM=0.85` | Grading thresholds (calibration in §4.25 and `grader_eval/`) |
 | `slide_rag.enrich_bank` constants | `PROMPT_VERSION=4`, `CORE_VERSION=5`, `VARIANT_MIN_SIM=0.35`, `VARIANT_MAX_CONTRADICTION=0.5`, `VARIANT_MAX_IMPLIED_BY_QUESTION=0.5` | Offline enrichment and its paraphrase filters |
@@ -1464,13 +1508,21 @@ Interviews serve the curated tier by default (`CAP_CURATED_ONLY=1`); `CAP_CURATE
 - **Follow-ups:** after each answer the system decides whether a follow-up is needed. A good answer moves on. Otherwise it asks for clarification (hesitation, fillers, broken sentences, a vague answer) or asks the prepared follow-up for a missing key point, **at most 1–2 per main question**.
 - **Phase 2 (backend) — done:** `main_cap/cap/tech_interview/`:
   - `bank.py` loads the active questions and, by default, serves only the curated ones (below); the selector favours topics asked often in interviews; `selector.py` picks 10 (standalone) or 8 (Round 2) from different topics across all five subjects, easy → medium → hard, never repeating a question the user has seen, weighted toward the user's weak topics;
-  - `grader.py` marks each key point covered / partial / missing with the NLI cross-encoder `cross-encoder/nli-deberta-v3-base` (entailment) plus a MiniLM-similarity rescue; score = 0.85 × key points + 0.15 × similarity to the reference answer (counted fully once half the points are met). Tuned on 100 hand-checked answers (key-point agreement 85% vs 72% for the earlier MiniLM NLI), then tested on 400 answers to 100 unseen questions (`grader_eval/`): 81% key-point agreement, score correlation 0.84, the same move-on decision as the human 89% of the time; 3% of weak answers pass, 9% of strong ones are held back; fillers stripped before grading but counted as hesitation;
+  - `grader.py` marks each key point covered / partial / missing with the NLI cross-encoder `cross-encoder/nli-deberta-v3-base` (entailment) plus a MiniLM-similarity rescue; score = 0.85 × key points + 0.15 × similarity to the reference answer (counted fully once half the points are met). Tuned on 100 hand-checked answers (key-point agreement 85% vs 72% for the earlier MiniLM NLI), then tested on 400 answers to 100 unseen questions (`grader_eval/`): 81% key-point agreement, score correlation 0.84, the same move-on decision as the human 89% of the time; 3% of weak answers pass, 9% of strong ones are held back; fillers stripped before grading but counted as hesitation. (Current figures on the 400 LLM-written answers, after the 2026-10-03 changes: key-point agreement 83%, correlation 0.89, same move-on decision 92%; see `grader_eval/baseline.json`. Human-style answers are much harder — see the update below);
   - `followup.py` decides next / clarify / prepared follow-up (≤ 2 per question, good ≥ 0.70); `session.py` runs the live interview; points recovered through a follow-up earn 0.75 credit;
   - routes `POST /api/tech-interview/start | /<id>/answer | /<id>/end` in `session_routes.py`; each main question is saved as one `SessionTurn` (topic in `category`, question id in `source_id`, follow-ups in `evaluation`). No new table or migration: "already seen" questions and per-topic averages are read from these turns;
   - `test_tech_interview.py`: 27 tests (incl. curated-only serving, interview-priority weighting and the contradiction cap).
+- **How one technical answer is graded, step by step (`grader.grade_answer`, then `followup.decide`):**
+  1. Filler words ("um", "like", "basically") are stripped and counted as hesitation.
+  2. Subject abbreviations are expanded in the answer, the key points and the reference ("DFS" → "depth-first search"), so both sides use the same words.
+  3. The answer is split into sentences, pairs of neighbouring sentences, and overlapping 20- and 40-word windows, because a point is often stated across two sentences and spoken answers often have no punctuation.
+  4. For each key point, the NLI model scores how strongly any piece entails it, and MiniLM scores how similar the closest piece is. **Covered:** entailment ≥ 0.6, or ≥ 0.2 with similarity ≥ 0.8. **Partial:** entailment ≥ 0.05 with similarity ≥ 0.6 or entailment ≥ 0.3. **Missing** otherwise, and always when similarity < 0.25 (the answer isn't about this point).
+  5. Score = 0.85 × key-point credit (covered 1, partial 0.5) + 0.15 × similarity to the reference answer (rescaled between a floor and a ceiling).
+  6. If the reference answer contradicts the whole answer (probability ≥ 0.5), the score is capped at 0.2.
+  7. Decision: "I don't know", the follow-up limit or a score ≥ 0.70 → next question; a hesitant (filler ratio ≥ 6%), vague or repetitive answer → a clarification request; otherwise the prepared follow-up for the first missing point, then partial ones (≤ 2 per question). A point recovered in a follow-up earns 0.75 credit, and the question is regraded.
 - **Grader on real answers (2026-09-30):** the LLM-written test sets flattered the grader; on 40 answers typed by the user (`grader_eval/my_answers.json`) main answers were graded too strictly and follow-ups were judged right only 15/40 times. Follow-up judging was rewritten: "I don't know" → missing, a yes/no rule ("nope"), and the reply read with its question counting only what it *adds* beyond the question. Now 30/40, with 8% of wrong replies accepted (tested by giving each follow-up the replies to other questions).
-- **Curated subset (2026-09-30):** every active question was read and scored 1–10 by hand (clear, answerable, key points correct and matching the question, sensible difficulty); the score and a one-line note are stored on each question (`quality_score`, `quality_note`). Each topic also has an **interview-frequency tier** (`interview_priority`: 3 asked very often, 2 regularly, 1 rarely; hand-assigned in `slide_rag/interview_priority.py`, re-applied with `python -m slide_rag.interview_priority`). The 132 scoring 8+, or 7+ on a tier-3 topic (156 after the 2026-10-03 repairs), are `"curated": true`, listed first in each bank file (most-asked first, then by score), and are the only ones new interviews use (`CAP_CURATED_ONLY`, default on): CN 18, DBMS 29, DSA 20, OOAD 36, OS 29. The selector multiplies each candidate's weight by x6 / x1 / x0.2 by tier, so 87% of questions asked come from tier-3 topics (47% without it) while no single topic appears in more than ~34% of sessions and a user taking 5 interviews in a row sees no repeated question; every 8-question interview still gets 8 distinct topics (checked on 3,000 simulated sessions). DSA has no curated hard question, so its hard slot falls back to a curated easy/medium one. 41 tier-3 topics still have no curated question (e.g. OSI model, DNS, paging, round robin, quick sort, hashing, SQL views) — listed in the review file for generation. Low scores flag false key points (e.g. "TCP guarantees minimum throughput", "the last level of a complete binary tree is always odd"), references to text the candidate never sees ("the code provided", "the example provided") and vague questions. Full list: `question_bank/quality_review.md`; bank backup: `archive/question_bank_backup_2026-09-30/`. Lookups by id (`question_by_id`) and the grader-eval scripts still see every active question.
-- **Grader and bank update (2026-10-02/03).** Full log and numbers: `technical_interview_problems_and_improvements.md`.
+- **Curated subset (2026-09-30):** every active question was read and scored 1–10 by hand (clear, answerable, key points correct and matching the question, sensible difficulty); the score and a one-line note are stored on each question (`quality_score`, `quality_note`). Each topic also has an **interview-frequency tier** (`interview_priority`: 3 asked very often, 2 regularly, 1 rarely; hand-assigned in `slide_rag/interview_priority.py`, re-applied with `python -m slide_rag.interview_priority`). The 132 scoring 8+, or 7+ on a tier-3 topic (156 after the 2026-10-03 repairs), are `"curated": true`, listed first in each bank file (most-asked first, then by score), and are the only ones new interviews use (`CAP_CURATED_ONLY`, default on): CN 18, DBMS 29, DSA 20, OOAD 36, OS 29. The selector multiplies each candidate's weight by x6 / x1 / x0.2 by tier, so 87% of questions asked come from tier-3 topics (47% without it) while no single topic appears in more than ~34% of sessions and a user taking 5 interviews in a row sees no repeated question; every 8-question interview still gets 8 distinct topics (checked on 3,000 simulated sessions). DSA has no curated hard question, so its hard slot falls back to a curated easy/medium one. 41 tier-3 topics had no curated question (30 after the 2026-10-03 repairs; e.g. OSI model, DNS, paging, round robin, quick sort, hashing, SQL views) — listed in the review file for generation. Low scores flag false key points (e.g. "TCP guarantees minimum throughput", "the last level of a complete binary tree is always odd"), references to text the candidate never sees ("the code provided", "the example provided") and vague questions. Full list: `question_bank/quality_review.md`; bank backup: `archive/question_bank_backup_2026-09-30/`. Lookups by id (`question_by_id`) and the grader-eval scripts still see every active question.
+- **Grader and bank update (2026-10-02/03).** The key numbers are below; the detailed log is kept outside the repository.
   - *Measurement:* `grader_eval/benchmark.py` grades every labelled set and fails on a regression against `baseline.json`. Sets: 400 LLM-written; 40 typed by a team member; 193 human-style team answers (`grader_eval/real_set/`, written to `ANSWER_PROMPT.md` and checked by each member). The team set is split by question into tune/test halves, plus a **fresh** set (50 answers) that is never tuned on. `grader_eval/sanity_check.py` needs no labels: every served question must pass its own reference answer and give < 0.5 to other questions' reference answers.
   - *Contradiction cap:* the NLI model checks whether the reference answer contradicts the whole answer; if so (≥ 0.5) the score is capped at 0.2. A recovered follow-up can't lift it. Per-point and per-sentence checks were rejected (they also fire on correct answers).
   - *Abbreviations (`terms.py`):* "DFS", "3NF", "LRU" etc. are expanded on both sides before grading, scoped per subject. Before this, "DFS explores…" got 0.34 from "Depth-first search explores…".
@@ -1479,6 +1531,41 @@ Interviews serve the curated tier by default (`CAP_CURATED_ONLY=1`); `CAP_CURATE
   - *Results on fresh human answers (never tuned on):* same move-on decision as a human 64% → 66%, score correlation 0.44 → 0.55, confidently-wrong answers 0.42 → 0.29. Still open: the grader under-scores correct real answers (avg 0.54 vs the humans' 0.66), and it accepts 29% of wrong follow-up replies.
 - **Offline enrichment (`slide_rag/enrich_bank.py`, Qwen3-8B once, 79 min):** writes informal variants of each key point, short correct follow-up replies and each question's main idea into the bank; contradicting and generic paraphrases are filtered out. Measured by part: the follow-up replies (near-exact match only) raise follow-ups to 35/40 with wrong replies still at 9% → **on by default**; the key-point variants and main idea let fluent wrong answers through (confidently wrong 0.21 → 0.53, same move-on decision as a human 357 → 294 / 400) → **off** (`CAP_GRADER_ENRICHMENT`).
 - **Phase 3 (frontend) — done:** in `templates/index.html`, both Home cards run the question-bank interview. The Technical Interview card (10 questions) goes straight to the rules, with no subject picker. The Full Interview's Round 2 asks 8. Follow-ups and clarification requests appear as their own chat turns, with no live scores. The standalone results page and Round 2 of the combined report show score, grade, per-subject bars, "worth revising" topics and per-question cards (answer, key points ✓/~/✗, follow-ups, model answer); history uses the same cards. The fill-in-the-blank quiz is gone from the UI; its routes (`/api/next_question`, `/api/evaluate`, `/api/technical-sessions`) remain in the backend, unused. Test: `node test_tech_interview_ui.js`.
+
+### 4.26 Live interview state and production mode (`live_store.py`, `serve.py`)
+
+**Why.** An interview in progress needs state between requests (which question is on screen, follow-ups used, answers so far). Kept in one process's memory, a second worker or server can't continue the interview, and a restart ends it. Production mode keeps that state in **Redis**, shared by every worker; **PostgreSQL** holds everything permanent. Redis and PostgreSQL never talk to each other; the app talks to both:
+
+```
+          ┌──► Redis       live interviews: small JSON records, expire after 2 h idle
+App ──────┤
+          └──► PostgreSQL  accounts, resumes, sessions, every answered turn (saved as it happens)
+```
+
+**The store.** `live_store.get_store()` picks the backend once from `CAP_LIVE_STORE`: `MemoryLiveStore` (default) or `RedisLiveStore`. Both store **plain JSON**, so the default mode runs the same code path as production. API: `get`, `put` (with a TTL of 2 h, matching `session_history.STALE_AFTER`), `delete`, and `lock(key)`, which is re-entrant: a thread lock in memory, a Redis lock across processes, so two requests for one interview can't overwrite each other.
+
+| Record | Owner | Holds |
+|---|---|---|
+| `profile:<id>` | `app.py` | The parsed profile loaded for one interview, its user and resume |
+| `conv:<id>` | `conversation_engine` | `{version, profile, evaluator: [name, version], turns: [{answer, evaluation}], current_question, ended}` |
+| `r1link:<conversation id>`, `r1by:<session id>` | `session_history` | Which database row a Round 1 conversation records into, and the question on screen |
+| `tech:<session id>` | `session_history` | `{version, user_id, state: TechInterview.to_state()}`: questions stored whole, index, records, current grades, pending follow-up |
+
+**Rebuilding.** A worker that didn't write the latest version rebuilds the objects from the record:
+- **Round 1 is replayed** (`conversation_engine._rebuild`): a new `Planner` from the stored profile, then every answered turn goes through the same planning steps as the live session (`_first_question`, `_plan_after_answer`); evaluations are restored from the record, never recomputed. This is exact because planning is deterministic (crc32, never `hash()` or `random`; verified identical across `PYTHONHASHSEED` values on 11 resumes) and never depends on evaluation results (flow invariant 3). It takes milliseconds. If a replay doesn't reach the stored current question (the planning code changed), the conversation is treated as expired.
+- **The technical interview is restored** (`TechInterview.from_state`); nothing is regraded.
+- **`LocalCache`** keeps the rebuilt objects per process and reuses them while the stored record's version is unchanged, so a single-process server never rebuilds.
+
+**Startup.** With the memory store, interviews still in progress are abandoned at startup (they can't continue). With Redis they're kept, because other workers may be running them; idle ones are abandoned after 2 h.
+
+**Production server.** `python serve.py` runs the same app under waitress (`CAP_HOST`, `CAP_PORT`, `CAP_THREADS`). Workers must share `CAP_DATABASE_URL` (PostgreSQL), `CAP_LIVE_STORE=redis` + `CAP_REDIS_URL`, `CAP_SECRET_KEY` (login cookies) and `CAP_UPLOAD_DIR`.
+
+**Verified (2026-10-15):**
+- The app suite passes with SQLite + memory, PostgreSQL + memory, and PostgreSQL + Redis.
+- `test_live_store.py`: store behaviour (both backends); a Round 1 conversation and a technical interview rebuilt from their record before **every** answer give exactly the same questions, scores and report as an uninterrupted run; a rebuild never re-evaluates.
+- Live: two `serve.py` processes sharing PostgreSQL and Redis; sign-up, a 10-question Round 1 and a 10-question technical interview with every request alternating between the servers, and server B killed and restarted mid-interview. All passed, and both sessions were saved completed.
+
+**Also fixed:** `migrations/env.py` applied `alembic.ini`'s logging config whenever migrations ran, which silenced the app's own loggers and raised the root level to WARN, so no INFO line appeared after startup. It now applies only when nothing has configured logging (`flask db` from the command line).
 
 ---
 
@@ -1628,12 +1715,8 @@ Startup logs show which evaluator is active: `averaged-heuristic-v1+overall-sing
 The code has no literal `TODO` markers. The items below come from docstrings, comments, and inspection.
 
 **Architecture and runtime**
-1. **Live interview state is still in memory:**
-   - `_candidate_profiles` / `_profile_owners`, `conversation_engine._conversations` and `session_history._live`;
-   - the RAG pool.
-
-   Answered turns are safe in SQLite, but live state is per-process, and `_candidate_profiles` entries are never evicted. The app can't run with multiple workers as-is.
-2. **Flask development server only.** There is no production WSGI server, container or CI.
+1. **Multiple workers need production mode** (§4.26). With the default memory live store, live interviews are per-process and end on restart. (Fixed 2026-10-15: profile sessions used to be kept forever; every live record now expires after 2 h.) The legacy v1 discussion engine and the RAG pool still keep their own in-memory state; neither is used by the UI.
+2. **No CI yet.** Production mode runs with `docker compose up` (§3.6), but tests are run by hand, and a deployment others can reach needs HTTPS in front of it (the browser allows the webcam only on HTTPS or `localhost`).
 3. **No login rate limiting, and no email verification yet.** `email_verified` exists but nothing checks it.
 4. **Some model weights are absent:** the old Experiment 4 `deployed_model/best_checkpoint_weights.pt` and the resume-classifier `bert_resume_model/`. The production Round 1 weights are not in the public repository either, so a clone runs on the heuristic evaluator. (Startup now detects the missing weights and skips the DeBERTa download.)
 5. **Client-side enforcement.** The session-integrity rules and the attention monitoring can be bypassed with DevTools, and the backend trusts the sanitised integrity record.
@@ -1764,14 +1847,14 @@ The code has no literal `TODO` markers. The items below come from docstrings, co
 | Startup | `test_model_warmup.py` (5) | pytest | Offline mode only when every needed model (incl. the trained backbone when its weights exist) is cached |
 | Frontend | `test_report_*.js`, `test_session_integrity.js` (13), `test_startup_guard.js`, `test_typeline_race.js` | `node <file>` | Each test extracts the exact function source from `index.html` and runs it with Node `vm` + `assert` (no framework). The integrity tests stub the `interview*` hooks |
 
-Tests that need the real `app.py` import `_app_test_setup.py`. It sets an in-memory database and a temporary upload folder, and stubs the DeBERTa bootstrap.
+Tests that need the real `app.py` import `_app_test_setup.py`. It sets the test database (in-memory SQLite by default), a temporary upload folder, and stubs the DeBERTa bootstrap. **On PostgreSQL:** `CAP_TEST_DATABASE_URL=postgresql+psycopg://cap:cap@localhost:5432/cap_test python -m pytest --ignore=resume_engine/tests` (PostgreSQL in Docker: `docker start cap-postgres`). 1,245 passed on both SQLite and PostgreSQL 16 (2026-10-15).
 | Legacy | `test_e2e.py` | `python test_e2e.py` | A script with PASS/FAIL counters for v1; pytest collects nothing from it |
 | Legacy RAG | `rag_system/rag_tester/test_*.py` | — | Stale (expect old layouts) |
 | Slide RAG unit tests | `rag_system/rag_tester/slide_rag/tests/test_pipeline.py` (19, incl. personal-note stripping) | `python -m pytest slide_rag/tests -q` (from `rag_system/rag_tester`) | Synthetic slide PDFs built with PyMuPDF: header/footer and slide-number removal, title detection, diagram labels set aside, deck titles, contents/admin slides, incremental builds, "(contd.)" merging, title normalisation (incl. `IPv4`), generic stems, quiz detection, problem + solution stitching, section size cap, BM25 tokenizer parity |
 | Slide RAG retrieval evaluation | `slide_rag/retrieval_eval.py`, `slide_rag/eval/gold_{cn,dbms,dsa,ooad,os}.json` | `python -m slide_rag.retrieval_eval` | 122 hand-labelled questions + 750 generated probes; results and ablations in §4.24 |
 
 The Milestone 7 report recorded 416 passing tests at the time (resume engine plus the app-level selector, profile and e2e tests), and an earlier ML-track note recorded 1,213 passing tests across the whole suite. At the time of this update, the latest runs showed:
-- **1244 passed, 18 skipped** for the whole `main_cap/cap` suite excluding the resume engine (`python -m pytest --ignore=resume_engine/tests`), **511** for the resume engine (2026-10-03);
+- **1245 passed, 18 skipped** (on SQLite and on PostgreSQL, 2026-10-15) for the whole `main_cap/cap` suite excluding the resume engine (`python -m pytest --ignore=resume_engine/tests`), **511** for the resume engine (2026-10-03);
 - **6 passed** for deployment;
 - all 9 frontend test files passing (incl. `test_tech_interview_ui.js`, `test_session_integrity.js`);
 - the grader evaluations in §4.25 (tuning set, 400 held-out answers, the user's 40 answers; scripts in `grader_eval/`);
@@ -1793,7 +1876,8 @@ The remaining suites weren't re-run for this update.
 | **Session (history)** | One saved interview round (`interview_sessions` row) with its turns; status `completed` / `terminated` / `abandoned` / `in_progress` |
 | **Abandoned** | A session that was never finished (restart, a new interview started, or 2 h idle); its answered turns are kept |
 | **Focus next** | Home-page list of the weaknesses that keep recurring in recent answers (`insights.py`) |
-| **Profile session id** | `profile_<hex>`: a key into the in-memory `_candidate_profiles` for one interview, owned by one user |
+| **Profile session id** | `profile_<hex>`: the key of a profile session in the live store (one resume's profile loaded for one interview, owned by one user) |
+| **Live store** | Where interviews in progress are kept between requests (`live_store.py`): this process's memory, or Redis shared by all workers (§4.26) |
 | **QuestionSpecification / unit** | An immutable record of *what* to ask and *why*, traceable to one profile entry |
 | **Category** | project_deep_dive, project_overview, experience, certification, skill_in_context |
 | **Family** | A phrasing angle (overview, tradeoffs, debugging, …) with 2 hand-written variants |

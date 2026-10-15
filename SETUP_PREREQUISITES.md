@@ -30,7 +30,7 @@ pip install -r Requirements_Global.txt
 
 The trained Round 1 evaluator's weights (`best_checkpoint_weights.pt`, 735 MB) are not part of this repository. **The app works without them**: Round 1 then uses the heuristic evaluator, and the startup log says which evaluator is active (`Production evaluator ACTIVE: ...`). If you have the file, place it at `main_cap/cap/deployed_model_overall_single_v5_1088/best_checkpoint_weights.pt` (SHA-256 `277ad4f69834991275c715727cfa58444284b23eb9e54cdf102964f4543a3cef`).
 
-### Models downloaded automatically on the first run (about 1.8 GB)
+### Models downloaded automatically on the first run (about 2 GB)
 
 From Hugging Face, into `~/.cache/huggingface/hub/`:
 
@@ -39,13 +39,14 @@ From Hugging Face, into `~/.cache/huggingface/hub/`:
 | `sentence-transformers/all-MiniLM-L6-v2` | ~90 MB | Resume parsing, Round 1 evaluator, technical grader |
 | `cross-encoder/nli-MiniLM2-L6-H768` | ~320 MB | Round 1 evaluator |
 | `cross-encoder/nli-deberta-v3-base` | ~720 MB | Technical grader |
+| `Systran/faster-whisper-base.en` | ~145 MB | Voice answers: speech-to-text on the server (`speech_to_text.py`) |
 | `microsoft/deberta-v3-base` | ~710 MB | Round 1 trained evaluator (only if the weights file above is installed) |
 
 The first start is therefore slow; after that the app loads them offline in a background thread (a running server in about 2 s). On Windows, Hugging Face may warn that symlinks are unavailable. That is harmless; turning on Windows Developer Mode silences it and saves some disk space.
 
 ### Browser and hardware for the interview itself
 
-- **Google Chrome or Microsoft Edge** (recent version). Voice answers use the browser's built-in speech recognition, which only Chromium browsers provide and which needs internet.
+- **A recent browser.** The app is mostly tested in Google Chrome and Microsoft Edge. Voice answers work in any current browser (Chrome, Edge, Brave, Firefox, Safari): the browser only records, and the server turns the recording into text (Whisper, below), so no Google or Microsoft speech service is involved.
 - A **webcam** (required: the interview won't start without one, and the camera setup check runs first), plus a **microphone** if you want to answer by voice.
 - Allow **camera, microphone and full screen** when the browser asks. The interview is proctored: leaving full screen, switching tabs or copy-pasting ends it.
 - A reasonably lit room: the camera check and the live monitor warn about low light, blur and a second person in frame.
@@ -65,6 +66,21 @@ python app.py          # then open http://localhost:5000
 ```
 
 This is Flask's development server, fine for local use and demos, not a production deployment.
+
+### Docker (optional)
+
+To run **production mode** (PostgreSQL + Redis + the waitress server) with `docker compose up` instead of installing Python and the packages (README, "Production mode with Docker"). Only the machine that runs the server needs this; people taking interviews just use a browser.
+
+| Need | Details |
+|---|---|
+| **Docker Desktop** | [docker.com](https://www.docker.com/products/docker-desktop/), tested with 29.8. On Linux, Docker Engine with the compose plugin is enough. |
+| **WSL 2** (Windows only) | Docker Desktop runs Linux containers inside it. If Docker Desktop says WSL is missing, run `wsl --install --no-distribution` in an administrator terminal and restart. |
+| **Disk** | About **6 GB** for the image (CPU-only PyTorch and the models are inside it), plus the database volume. |
+| **RAM** | As above: about 3 GB for the app, plus a little for PostgreSQL and Redis. On Windows, containers may use up to half the machine's RAM by default, which is enough with 8 GB or more. |
+| **Internet** | Only for the first build (about 3 GB of downloads). The running container needs none, except the browser still loads MediaPipe and fonts from the internet. |
+| **Evaluator weights** | Optional. If present at the path above, they are mounted into the container read-only; otherwise Round 1 uses the heuristic evaluator. |
+
+**Deploying for other people:** the webcam only works on `http://localhost` or over **HTTPS**, so a server that others reach by its address needs HTTPS in front of it (a reverse proxy with a certificate, or a tunnel). Set `CAP_SECRET_KEY` and `POSTGRES_PASSWORD` in `.env` before the first start.
 
 ---
 
