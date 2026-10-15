@@ -47,38 +47,56 @@ This was a 4-person capstone project at PES University. The work below is mine:
 
 ---
 
-## Quick start
+## Quick start (Docker, recommended)
 
-**Requirements:** Python 3.12, ~8 GB RAM, a recent browser (mostly tested in Chrome and Edge) with a webcam and microphone, internet on the first run (model downloads). No GPU needed. Full list: [`SETUP_PREREQUISITES.md`](SETUP_PREREQUISITES.md).
+Docker builds everything for you: Python, every package and every model go into the image, and the app runs with PostgreSQL and Redis. Nothing to install except Docker.
+
+**You need:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) (on Windows it also needs WSL 2), about 8 GB RAM and 10 GB free disk, and a browser with a webcam. Full list: [`SETUP_PREREQUISITES.md`](SETUP_PREREQUISITES.md).
 
 ```bash
+git clone https://github.com/sr4ninad/AI-Resume-Grounded-Interview-Platform.git
+cd AI-Resume-Grounded-Interview-Platform
+docker compose up --build -d     # first time ~15 min (downloads ~3 GB); later starts take seconds
+```
+
+Open **http://localhost:5000**, sign up with a resume, and start an interview from Home. `docker compose logs -f app` shows the server starting (Ctrl+C stops watching, not the app).
+
+| Task | Command (from the repository root) |
+|---|---|
+| Stop | `docker compose down` (your data is kept) |
+| Start again | `docker compose up -d` |
+| After pulling or changing code | `docker compose up --build -d` (rebuilds only the code layer, seconds) |
+| Logs | `docker compose logs -f app` |
+| Database shell | `docker compose exec postgres psql -U cap cap` |
+
+- **Your data** (accounts, resumes, sessions, interviews in progress) lives in Docker volumes and is kept across `down` / `up` and rebuilds. **`docker compose down -v` deletes it.**
+- **The trained Round 1 evaluator weights are not included** (735 MB). Without them Round 1 uses the heuristic evaluator; the startup log says which one is active. If you have the file, put it in `main_cap/cap/deployed_model_overall_single_v5_1088/` and it is mounted into the container.
+- **Optional settings** (port, database password, secret key, threads): copy `.env.example` to `.env`.
+- **Bringing over data from a non-Docker install** (the SQLite file and its resumes): with the stack running, from the repository root:
+  ```bash
+  docker compose cp main_cap/cap/instance/app.db app:/tmp/app.db
+  docker compose cp main_cap/cap/instance/uploads app:/tmp/uploads
+  docker compose exec app python copy_database.py --from sqlite:////tmp/app.db --from-uploads /tmp/uploads --replace
+  ```
+  `--replace` first deletes everything already in the Docker database.
+
+### Without Docker (for development and running the tests)
+
+Needed only to work on the code or run the test suite. **Requirements:** Python 3.12, about 8 GB RAM and internet on the first run (about 2 GB of models download then). Node.js only for the frontend tests. Details: [`SETUP_PREREQUISITES.md`](SETUP_PREREQUISITES.md).
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # no NVIDIA GPU: small CPU-only PyTorch
 pip install -r Requirements_Global.txt
 cd main_cap/cap
-python app.py          # http://localhost:5000
+python app.py                    # http://localhost:5000
 ```
 
-Sign up with a resume and start an interview from Home. The SQLite database and its migrations are created automatically.
-
-**Trained Round 1 model weights are not included** (735 MB). Without them the app runs normally, and Round 1 uses the heuristic evaluator; the startup log says which evaluator is active.
-
-### Production mode with Docker
-
-One command runs the app with PostgreSQL and Redis, with no Python install. Needs [Docker Desktop](https://www.docker.com/products/docker-desktop/) (WSL 2 on Windows). From the repository root:
-
-```bash
-docker compose up --build -d     # first build ~15 min (downloads ~3 GB); later starts take seconds
-docker compose logs -f app       # watch it start
-docker compose down              # stop (data is kept in volumes; `down -v` deletes it)
-```
-
-| | `python app.py` (simple mode) | `docker compose up` (production mode) |
+| | Docker (default) | `python app.py` |
 |---|---|---|
-| Database | SQLite file | PostgreSQL 16 |
-| Interviews in progress | Process memory; a restart ends them | Redis; survive a restart |
-| Server | Flask development server | waitress (`serve.py`) |
-| Install | Python 3.12 + packages | Docker only |
-
-Optional settings (port, database password, secret key, threads): copy `.env.example` to `.env`. To move existing data from the SQLite file into the Docker database, see `copy_database.py` and [`PROJECT_DOCUMENTATION.md`](PROJECT_DOCUMENTATION.md) §3.6.
+| Install | Docker only | Python 3.12 + packages + models |
+| Database | PostgreSQL | SQLite file (`main_cap/cap/instance/`, created automatically) |
+| Interviews in progress | Redis; survive a restart | Process memory; a restart ends them |
+| Server | waitress (`serve.py`) | Flask development server |
 
 ## Tests
 
